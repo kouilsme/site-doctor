@@ -13,6 +13,18 @@ python3 site_doctor.py https://kouils.me
 
 就这一个文件，Python 3.8+、只用标准库，不用 pip、不用账号、不用服务。
 
+Windows PowerShell 注意：PowerShell 自带的 `curl` 不是真正的 curl，而是 `Invoke-WebRequest` 的别名，`-O` 会报错。Windows 下请用下面二选一，并用 `python`（不是 `python3`）运行：
+
+```powershell
+curl.exe -O https://raw.githubusercontent.com/kouilsme/site-doctor/main/site_doctor.py
+python site_doctor.py https://kouils.me
+```
+
+```powershell
+Invoke-WebRequest -Uri https://raw.githubusercontent.com/kouilsme/site-doctor/main/site_doctor.py -OutFile site_doctor.py
+python site_doctor.py https://kouils.me
+```
+
 ## 它会先给一句话结论
 
 ```text
