@@ -17,17 +17,22 @@ site-doctor: 一条命令告诉你网站挂了到底是谁的锅。
 只用 Python 标准库，无第三方依赖，Python 3.8+ 可跑。
 """
 import argparse
+import ipaddress
 import json
+import math
 import os
+import queue
+import re
 import socket
 import ssl
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, urljoin, urlparse, urlunparse
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 
 # 常见 CDN 的响应头特征，只做“提示”，不做绝对判定。
 CDN_HINTS = [
@@ -84,12 +89,17 @@ def detect_cdn_from_headers(headers):
     return name, evidence
 
 
-def dig_cname(host):
+def dig_cname(host, timeout=5):
     """可选：用 dig 查 CNAME，dig 不存在或失败时静默返回空。"""
+    try:
+        ipaddress.ip_address(host)
+        return []  # IP 字面量没有需要查询的 CNAME。
+    except ValueError:
+        pass
     try:
         out = subprocess.run(
             ["dig", "+short", "CNAME", host],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, timeout=min(timeout, 5),
         ).stdout.strip()
         return [line for line in out.splitlines() if line.strip()]
     except Exception:
@@ -97,19 +107,25 @@ def dig_cname(host):
 
 
 def resolve(host, timeout):
-    """返回 (ips, dns_ms, error)。"""
+    """限制等待系统解析器的时间，不修改进程全局 socket 设置。"""
     start = time.monotonic()
-    try:
-        old = socket.getdefaulttimeout()
-        socket.setdefaulttimeout(timeout)
+    answers = queue.Queue(maxsize=1)
+
+    def lookup():
         try:
-            infos = socket.getaddrinfo(host, None)
-        finally:
-            socket.setdefaulttimeout(old)
-        ips = sorted({info[4][0] for info in infos})
-        return ips, ms(start), ""
-    except Exception as e:
-        return [], ms(start), str(e)
+            infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+            # 保留系统地址优先级（包括 IPv6），并去重。
+            answers.put((list(dict.fromkeys(info[4][0] for info in infos)), ""))
+        except Exception as exc:
+            answers.put(([], str(exc)))
+
+    # getaddrinfo 不受 socket timeout 控制；后台线程允许调用方按时返回。
+    threading.Thread(target=lookup, daemon=True).start()
+    try:
+        ips, error = answers.get(timeout=timeout)
+        return ips, ms(start), error
+    except queue.Empty:
+        return [], ms(start), f"DNS 解析超过 {timeout:g} 秒"
 
 
 def tcp_connect(ip, port, timeout):
@@ -125,7 +141,9 @@ def tls_info(sock, host, timeout):
     """在已有 TCP 连接上做 TLS 握手，返回 (ssl_sock, tls_ms, cert_days, error)。"""
     start = time.monotonic()
     ctx = ssl.create_default_context()
+    ssock = None
     try:
+        sock.settimeout(timeout)
         ssock = ctx.wrap_socket(sock, server_hostname=host)
         cert = ssock.getpeercert()
         days = None
@@ -136,7 +154,7 @@ def tls_info(sock, host, timeout):
         return ssock, ms(start), days, ""
     except Exception as e:
         try:
-            sock.close()
+            (ssock if ssock is not None else sock).close()
         except Exception:
             pass
         return None, ms(start), None, str(e)
@@ -147,7 +165,10 @@ def http_get(sock, host, port, path, use_tls, timeout):
     import http.client
 
     start = time.monotonic()
+    conn = None
+    resp = None
     try:
+        sock.settimeout(timeout)
         if use_tls:
             conn = http.client.HTTPSConnection(host, port, timeout=timeout)
             conn.sock = sock
@@ -155,21 +176,55 @@ def http_get(sock, host, port, path, use_tls, timeout):
             conn = http.client.HTTPConnection(host, port, timeout=timeout)
             conn.sock = sock
         conn.putrequest("GET", path or "/", skip_host=True, skip_accept_encoding=True)
-        conn.putheader("Host", host)
+        authority = f"[{host}]" if ":" in host else host
+        if port != (443 if use_tls else 80):
+            authority += f":{port}"
+        conn.putheader("Host", authority)
         conn.putheader("User-Agent", f"site-doctor/{VERSION}")
         conn.putheader("Accept", "*/*")
         conn.putheader("Connection", "close")
         conn.endheaders()
         resp = conn.getresponse()
         ttfb = ms(start)
-        try:
-            resp.read(4096)
-        except Exception:
-            pass
+        # 诊断只需要状态和响应头；读取正文会被流式响应拖到超时。
         headers = {k: v for k, v in resp.getheaders()}
         return resp.status, headers, ttfb, ""
     except Exception as e:
         return None, {}, ms(start), str(e)
+    finally:
+        if resp is not None:
+            resp.close()
+        if conn is not None:
+            conn.close()
+
+
+def normalize_url(url):
+    """校验 HTTP(S) URL，并统一 IDN、路径编码和默认协议。"""
+    url = url.strip()
+    if not url or any(ord(c) < 32 or ord(c) == 127 for c in url):
+        raise ValueError("URL 不能为空或包含控制字符")
+    parsed = urlparse(url if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", url)
+                      else "https://" + url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("只支持 http:// 和 https://")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("不支持 URL 内嵌用户名或密码")
+    host = parsed.hostname
+    if not host or any(c.isspace() for c in host) or "\\" in host:
+        raise ValueError("缺少有效的 hostname")
+    host = host.encode("idna").decode("ascii").lower()
+    port = parsed.port  # 非法端口由 urllib 检查。
+    if port == 0:
+        raise ValueError("端口必须在 1 到 65535 之间")
+    authority = f"[{host}]" if ":" in host else host
+    if port is not None and port != (443 if parsed.scheme == "https" else 80):
+        authority += f":{port}"
+    raw_path = parsed.path or "/"
+    if parsed.params:
+        raw_path += ";" + parsed.params
+    path = quote(raw_path, safe="/%:@!$&'()*+,;=-._~")
+    query = quote(parsed.query, safe="/%?:@!$&'()*+,;=-._~")
+    return urlunparse((parsed.scheme, authority, path, "", query, ""))
 
 
 def check_via(ip, host, port, path, use_tls, timeout):
@@ -205,21 +260,24 @@ def check_via(ip, host, port, path, use_tls, timeout):
 
 def fetch_single(url, timeout):
     """对一个 URL 做一次 DNS + 主路径检查（不跟随重定向），返回中间结果。"""
-    parsed = urlparse(url if "://" in url else "https://" + url)
-    host = parsed.hostname
-    if not host:
+    try:
+        parsed = urlparse(normalize_url(url))
+    except (ValueError, UnicodeError) as exc:
         return None, {"url": url, "host": "", "verdict": "URL_INVALID",
-                      "conclusion": "URL 解析失败：给的地址里没有 hostname，先检查 URL 本身。"}
+                      "conclusion": f"URL 解析失败：{exc}。"}
+    host = parsed.hostname
     scheme = parsed.scheme or "https"
     use_tls = scheme == "https"
     port = parsed.port or (443 if use_tls else 80)
     path = parsed.path or "/"
+    if parsed.params:
+        path += ";" + parsed.params
     if parsed.query:
         path += "?" + parsed.query
     ips, dns_ms, dns_err = resolve(host, timeout)
     out = {"url": url, "host": host, "port": port, "scheme": scheme,
            "dns_ms": dns_ms, "dns_error": dns_err, "ips": ips,
-           "cname": dig_cname(host), "timeout": timeout}
+           "cname": [], "timeout": timeout}
     if not ips:
         out["verdict"] = "DNS_FAIL"
         out["conclusion"] = (
@@ -228,7 +286,15 @@ def fetch_single(url, timeout):
             "不是源站也不是 CDN 的锅。"
         )
         return None, out
-    main = check_via(ips[0], host, port, path, use_tls, timeout)
+    attempts = []
+    for ip in ips:
+        main = check_via(ip, host, port, path, use_tls, timeout)
+        attempts.append(main)
+        # 只在连接/协议失败时回退，不隐藏真实的 4xx / 5xx 响应。
+        if main["status"] is not None:
+            break
+    out["attempts"] = attempts
+    out["cname"] = dig_cname(host, timeout)
     out["main"] = main
     cdn_name, cdn_evidence = detect_cdn_from_headers(main["headers"])
     out["cdn_hint"] = cdn_name
@@ -238,19 +304,28 @@ def fetch_single(url, timeout):
 
 def diagnose(url, origin_ip="", timeout=10, cert_warn_days=14, max_redirects=5):
     """完整诊断：跟随重定向（最多 max_redirects 次），再做结论判定。"""
-    current = url
+    try:
+        current = normalize_url(url)
+    except (ValueError, UnicodeError):
+        return fetch_single(url, timeout)[1]
+    initial_host = urlparse(current).hostname
     chain = []
     seen = set()
     fetch = None
     out = None
     for _ in range(max_redirects + 1):
         if current in seen:
-            out = out or {"url": url, "host": "", "verdict": "REDIRECT_LOOP",
-                          "conclusion": "重定向死循环：这个 URL 在几个地址之间来回跳，先查重定向规则。"}
+            out["verdict"] = "REDIRECT_LOOP"
+            out["conclusion"] = "重定向死循环：这个 URL 在几个地址之间来回跳，先查重定向规则。"
+            out["url"] = url
+            out["final_url"] = current
             out["redirect_chain"] = chain
             return out
         seen.add(current)
         fetch, out = fetch_single(current, timeout)
+        out["url"] = url
+        if chain:
+            out["final_url"] = current
         if fetch is None:
             out["redirect_chain"] = chain
             return out
@@ -259,8 +334,17 @@ def diagnose(url, origin_ip="", timeout=10, cert_warn_days=14, max_redirects=5):
         lowered = {k.lower(): v for k, v in main["headers"].items()}
         location = lowered.get("location", "")
         if status in (301, 302, 303, 307, 308) and location:
-            chain.append({"from": current, "status": status, "to": urljoin(current, location)})
-            current = urljoin(current, location)
+            try:
+                target = urljoin(current, location)
+                target = normalize_url(target)
+            except (ValueError, UnicodeError) as exc:
+                chain.append({"from": current, "status": status, "to": location})
+                out["verdict"] = "URL_INVALID"
+                out["conclusion"] = f"重定向目标无效：{exc}。"
+                out["redirect_chain"] = chain
+                return out
+            chain.append({"from": current, "status": status, "to": target})
+            current = target
             continue
         break
     else:
@@ -279,13 +363,13 @@ def diagnose(url, origin_ip="", timeout=10, cert_warn_days=14, max_redirects=5):
     origin = None
     # 只有终点主机和原始主机一致时，源站直连对比才有意义。
     final_host = urlparse(current).hostname
-    if origin_ip and final_host == urlparse(url if "://" in url else "https://" + url).hostname:
+    if origin_ip and final_host == initial_host:
         origin = check_via(origin_ip, final_host, port, path, use_tls, timeout)
         out["origin"] = origin
 
     # ---- 结论判定，按“最先挂的那一层”优先 ----
     if main["tcp_error"]:
-        if origin and not origin["tcp_error"] and origin["status"]:
+        if origin and origin["status"] is not None and origin["status"] < 500:
             out["verdict"] = "CDN_FAIL"
             out["conclusion"] = (
                 f"CDN / 边缘侧出问题：走 DNS 解析到的 {main['ip']} 连 TCP 都失败"
@@ -311,7 +395,7 @@ def diagnose(url, origin_ip="", timeout=10, cert_warn_days=14, max_redirects=5):
         return out
 
     if main["status"] is None:
-        if origin and origin["status"]:
+        if origin and origin["status"] is not None and origin["status"] < 500:
             out["verdict"] = "CDN_FAIL"
             out["conclusion"] = (
                 f"CDN 侧 HTTP 失败：直连源站 {origin_ip} 能返回 {origin['status']}，"
@@ -320,8 +404,10 @@ def diagnose(url, origin_ip="", timeout=10, cert_warn_days=14, max_redirects=5):
         elif origin and not origin["status"]:
             out["verdict"] = "ORIGIN_DEAD"
             out["conclusion"] = (
-                "源站死了：走 CDN 和直连源站都拿不到 HTTP 响应，"
-                f"CDN 侧错误：{main['http_error']}；源站侧错误：{origin['http_error']}。"
+                "源站或回源链路异常：主路径和直连源站都拿不到 HTTP 响应，"
+                f"主路径错误：{main['http_error']}；源站侧错误："
+                f"{origin['tcp_error'] or origin['tls_error'] or origin['http_error']}。"
+                "也可能是源站限制直连，需要结合源站日志确认。"
             )
         else:
             out["verdict"] = "HTTP_FAIL"
@@ -342,14 +428,14 @@ def diagnose(url, origin_ip="", timeout=10, cert_warn_days=14, max_redirects=5):
                 out["verdict"] = "ORIGIN_DEAD"
             out["conclusion"] = (
                 f"Cloudflare 返回 {status}：{CF_CODES[status]}，"
-                "CDN 本身在跑，问题在源站这一段，修源站，不是修 CDN。"
+                "请检查源站服务、回源配置及 Cloudflare 到源站的网络 / 防火墙。"
             )
             return out
         if origin and not origin["status"]:
             out["verdict"] = "ORIGIN_DEAD"
             out["conclusion"] = (
-                f"源站死了：CDN 返回 {status}，直连源站 {origin_ip} 也拿不到响应，"
-                "CDN 只是把源站的错误透传回来，修源站，不是修 CDN。"
+                f"源站或回源链路异常：主路径返回 {status}，直连源站 {origin_ip} 也拿不到响应，"
+                "请检查源站服务和防火墙；若源站仅允许 CDN 访问，直连失败不能证明源站宕机。"
             )
         elif origin and origin["status"] and origin["status"] < 500:
             out["verdict"] = "CDN_FAIL"
@@ -361,12 +447,14 @@ def diagnose(url, origin_ip="", timeout=10, cert_warn_days=14, max_redirects=5):
             hint = f"（检测到 CDN 特征：{cdn_name}）" if cdn_name else "（未检测到常见 CDN 头，可能是直连源站）"
             out["verdict"] = "ORIGIN_5XX"
             out["conclusion"] = (
-                f"源站返回 {status}：服务在跑但出错了{hint}，"
-                "先看源站应用日志和 5xx 的具体路径；如果给了 --origin-ip，能更确定是源站还是 CDN。"
+                f"HTTP 返回 {status}：服务端或上游链路出错了{hint}，"
+                "先看源站应用日志和 5xx 的具体路径；仅凭响应头不能确定错误来自源站还是 CDN。"
             )
         return out
 
     warnings = []
+    if len(out.get("attempts", [])) > 1:
+        warnings.append(f"前 {len(out['attempts']) - 1} 个 IP 检查失败，已回退到 {main['ip']}")
     if main["cert_days"] is not None and main["cert_days"] < cert_warn_days:
         warnings.append(f"证书 {main['cert_days']} 天后过期")
     if out["dns_ms"] > 2000:
@@ -421,6 +509,9 @@ def print_human(r, use_color=True):
         print(f"解析 IP：{', '.join(r['ips'])}")
     if r.get("cname"):
         print(f"CNAME：{', '.join(r['cname'])}")
+    for attempt in r.get("attempts", [])[:-1]:
+        error = attempt["tcp_error"] or attempt["tls_error"] or attempt["http_error"]
+        print(f"IP 回退：{attempt['ip']}（{error}）")
     m = r.get("main")
     if m:
         print(f"主路径：TCP {m['tcp_ms']} ms"
@@ -461,6 +552,17 @@ def main(argv=None):
     if args.version:
         print(VERSION)
         return 0
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        ap.error("--timeout 必须是大于 0 的有限数字")
+    if args.max_redirects < 0:
+        ap.error("--max-redirects 不能小于 0")
+    if args.cert_warn_days < 0:
+        ap.error("--cert-warn-days 不能小于 0")
+    if args.origin_ip:
+        try:
+            ipaddress.ip_address(args.origin_ip)
+        except ValueError:
+            ap.error("--origin-ip 必须是有效的 IPv4 或 IPv6 地址")
     if not args.urls:
         ap.error("请至少给一个 URL，例如：python3 site_doctor.py https://kouils.me")
     use_color = (not args.no_color and "NO_COLOR" not in os.environ
