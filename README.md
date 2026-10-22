@@ -34,7 +34,7 @@ python3 site_doctor.py https://example.com
 # 一次查多个站
 python3 site_doctor.py https://kouils.me https://example.com
 
-# 有源站 IP 时，直连绕过 CDN 对比，源站死还是 CDN 坏基本能定死
+# 有源站 IP 时，直连绕过 CDN 对比，辅助定位源站或 CDN 链路问题
 python3 site_doctor.py https://status.kouils.me --origin-ip 20.18.254.79
 
 # 给脚本用：JSON 输出 + 退出码（通了返回 0，挂了返回 1）
@@ -55,18 +55,33 @@ python3 site_doctor.py https://example.com --no-color
 | `DNS_FAIL` | 域名解析不到 IP，先查 DNS / 域名状态 |
 | `TCP_FAIL` | 端口连不上，可能是防火墙 / 服务没起 |
 | `TLS_FAIL` | 证书过期、不匹配或 TLS 配置问题 |
-| `ORIGIN_DEAD` | 走 CDN 和直连源站都失败，源站死了；Cloudflare 521-524 不用给源站 IP 也能定到源站 |
+| `ORIGIN_DEAD` | 源站或回源链路异常；直连失败也可能是防火墙限制，需结合日志确认 |
 | `CDN_FAIL` | 源站直连是好的，走 CDN 失败，问题在 CDN 段 |
-| `ORIGIN_5XX` | 源站返回 5xx（没给 `--origin-ip` 且不是 Cloudflare 代码时，按头信息推断） |
+| `ORIGIN_5XX` | HTTP 返回 5xx；保留原判定名，但仅凭响应头不能确定是源站还是 CDN 生成 |
 | `REDIRECT_LOOP` | 重定向超过 5 次还没到终点，或来回跳 |
-| `UP_WITH_WARNING` | 通的，但证书快过期或 DNS 很慢 |
+| `UP_WITH_WARNING` | 通的，但证书快过期、DNS 很慢，或部分 IP 失败后回退成功 |
 | `UP` / `UP_BUT_4XX` | 通的；4xx 是这个 URL 本身的问题，不是全站挂 |
+| `HTTP_FAIL` | TCP / TLS 已通，但无法获取 HTTP 响应头 |
+| `URL_INVALID` | URL 或重定向目标无效，包括不支持的协议、非法端口 |
 
 重定向会自动跟随，最多 5 次，链路会完整打印出来。
 
 ## 为什么加 `--origin-ip` 很重要
 
-不加时，5xx 只能靠 CDN 响应头推断。给了源站真实 IP，工具会绕过 CDN 直连源站做一次同样的检查，两边一对比，是源站死还是 CDN 坏就基本确定了。例外：Cloudflare 的 521（源站拒绝连接）、522（连源站超时）、523（找不到源站）、524（源站太慢）、525/526（TLS / 证书问题）本身就是源站问题的证据，不用加也能定位。
+不加时，5xx 只能靠 CDN 响应头推断。给了源站真实 IP，工具会保留目标域名的 Host / TLS SNI，绕过 CDN 直连源站做一次同样的检查。两边对比可以缩小排查范围，但源站仅允许 CDN IP、使用私有 CA 或限制访问时，直连失败不代表源站宕机。跨域重定向后不会把原源站 IP 用到新域名上。
+
+Cloudflare 的 521（源站拒绝连接）、522（连源站超时）、523（找不到源站）、524（源站太慢）、525/526（TLS / 证书问题）可以指向回源链路，需要继续检查源站服务、CDN 回源配置和中间网络。
+
+## v0.2.1 可靠性优化
+
+- 修复重定向循环导致缺少判定字段的问题；省略协议的地址也能正确跟随相对重定向。
+- 按系统返回的顺序尝试 IP，连接 / TLS / HTTP 协议失败时回退；收到实际 HTTP 响应就停止，不通过重试隐藏 4xx / 5xx。JSON 的 `attempts` 保留每次尝试，`main` 表示最后选中的路径。
+- 支持中文域名和中文路径，补全非默认端口及 IPv6 的 Host 请求头，保留路径参数。
+- 非法 URL 返回 `URL_INVALID`，不会打断其他 URL 的批量检查；命令行参数非法时返回退出码 2。
+- HTTP 检查只读取响应头，避免等待流式正文；正常和异常路径都关闭 HTTP 连接。
+- DNS 等待受 `--timeout` 限制，不再修改进程全局 socket 超时。
+
+`--timeout` 是 DNS 等待和各网络操作的超时，不是整次诊断的总时限。多 IP 回退、重定向、源站对比会累加耗时；收到响应头的耗时记录在 `ttfb_ms`，不包含正文下载。系统 DNS 调用无法由标准库安全取消，超时后其后台守护线程可能继续运行至系统解析器返回；本工具仍面向一次性 CLI 诊断，不建议直接用作高并发常驻服务。可选的 `dig` 查询最多等待 `min(timeout, 5)` 秒，IP 字面量和 DNS 失败时跳过。
 
 ## 明确不做的事
 
@@ -80,7 +95,7 @@ python3 site_doctor.py https://example.com --no-color
 python3 -m unittest discover -s tests -v
 ```
 
-覆盖：UP、502、源站直连对比出的 CDN_FAIL、重定向跟随、Cloudflare 521、DNS 失败、TCP 拒绝、退出码。
+覆盖：UP / 4xx / 5xx、源站对比、Cloudflare 521、循环与相对重定向、无效目标、跨域源站隔离、DNS 超时、多 IP 回退、IPv6 / 非默认端口 Host、中文 URL、参数验证、JSON / 退出码及连接清理。测试使用系统分配的临时端口，结束时关闭服务器，不依赖固定端口或外网。
 
 ## License
 
